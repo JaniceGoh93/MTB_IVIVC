@@ -1,0 +1,1176 @@
+---
+title: "IVIVCPipeline"
+author: "Janice"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Settings
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(xpose4)
+library(xpose)
+library(viridis)
+library(MESS)
+library(drc)
+library(gridExtra)
+library(caret)
+library(tidymodels)
+library(ranger)
+library(zoo)
+library(rsample)
+library(nnet)
+library(ggraph)
+library(corrr)
+library(tidygraph)
+library(igraph)
+library(ggbump)
+library(cowplot)
+setwd("/Users/jgoh/Documents/GitHub/MTB_IVIVC")
+```
+
+## load in vitro data 
+
+```{r}
+drugMetadata <- read_excel("invitroAssay_mockData.xlsx", sheet = "drugMetadata")
+invitro <- read_excel("invitroAssay_mockData.xlsx", sheet = "invitro") %>%
+            filter(!value == "ND") %>%
+            mutate(value = gsub(">[0-9]+", 99999, value) %>%
+                            gsub("> [0-9]+", 99999, .) %>%
+                            gsub("<", "", .) %>%
+                            gsub("NA", 99999, .)) %>% 
+            mutate(value = as.numeric(value))%>%
+  dplyr::select(DrugName, assayType, ParamType, value, Unit) %>% 
+  left_join(drugMetadata %>% dplyr::select(DrugName, MW_g.mol) %>% distinct(), by = "DrugName") %>%
+  mutate(value_mg.L = if_else(Unit == "uM", value*MW_g.mol*10^-3, value),
+         value_uM = value_mg.L/MW_g.mol*1000,
+         DrugName = gsub(" ", "", DrugName)) 
+```
+
+
+## calculating new EC50 and EC90 from general drc 
+
+```{r}
+invitro_adj <- invitro %>% 
+  mutate(ParamType = gsub("EC", "", ParamType) %>% 
+              as.numeric(.),
+         calculatedEC50 = if_else(ParamType != 50, value_mg.L*(100-ParamType)/(ParamType), value_mg.L),
+         calculatedEC50_uM = if_else(ParamType != 50, value_mg.L*(100-ParamType)/(ParamType), value_uM),
+         calculatedEC90 = calculatedEC50 *(90/(100-90))) 
+
+```
+
+## load mouse data 
+```{r}
+Mouse_EC50 <- read_excel("invitroAssay_mockData.xlsx", sheet = "Mouse_EC50")%>% 
+                mutate(ModelType = gsub("Infection", "", ModelType),
+                       ModelType = factor(ModelType, levels = c("Acute", "Subacute", "Chronic"))) 
+```
+
+
+## Prep dataframe for regression analysis 
+
+```{r}
+regDf <- invitro_adj %>% 
+        dplyr::select(DrugName, calculatedEC50, calculatedEC50_uM, assayType) %>% 
+        drop_na(calculatedEC50) %>% 
+        group_by(DrugName,assayType) %>% 
+        summarize(meanEC50 = mean(calculatedEC50),
+                  meanEC50_uM = mean(calculatedEC50_uM)) %>% 
+  right_join(Mouse_EC50, by = c("DrugName")) %>% 
+  mutate(ModelType = factor(ModelType, 
+                            levels = c("Acute", "Subacute", "Chronic")),
+         totalMouseEC50 = value, ## no fu correction here
+         assayType = gsub("^3", "three", assayType) %>%
+                      gsub("^4", "four", .) %>% 
+                      gsub("^10", "ten", .)) 
+
+drugKey <- regDf %>% 
+            dplyr::select(DrugName, ModelType, totalMouseEC50) %>% 
+            distinct() %>% 
+            mutate(totalMouseEC50 = log10(totalMouseEC50)) %>% 
+            ungroup()
+```
+
+
+## function for univariate regression by model type 
+
+```{r, univariate regression by model type }
+univarLm_df <- function(model.idx){
+   lapply(unique(regDf$assayType), function(assay){
+  print(assay)
+  df <- regDf %>% 
+        filter(assayType == assay &
+               ModelType == model.idx &
+                 meanEC50 < 1000)
+  if(df$meanEC50 %>% unique() %>% length() == 1 |
+     nrow(df) <=2){
+    summary(mod)$coefficients %>% 
+    as.data.frame() %>% 
+    rownames_to_column("param") %>% 
+    mutate(rsq = summary(mod)$r.squared,
+           p.val = summary(mod)$`Pr(>|t|)`,
+           assayType = assay,
+           Ndata = nrow(df)) }else {
+    mod <- lm(log10(totalMouseEC50)~ log10(meanEC50), data = df)        
+    summary(mod)$coefficients %>% 
+    as.data.frame() %>% 
+    rownames_to_column("param") %>% 
+    mutate(rsq = summary(mod)$r.squared,
+           p.val = summary(mod)$`Pr(>|t|)`,
+           assayType = assay,
+           Ndata = nrow(df))
+  }
+    
+  }
+  ) %>% do.call(rbind,.) %>% 
+  filter(param == "log10(meanEC50)")
+}
+ 
+univarLm_plot <- function(model.idx){
+   lapply(unique(regDf$assayType), function(assay){
+  print(assay)
+  df <- regDf %>% 
+        filter(assayType == assay &
+               ModelType == model.idx &
+                 meanEC50 < 1000)
+  
+  if(df$meanEC50 %>% unique() %>% length() <= 1 |
+     nrow(df) <=2){
+      plot(
+       x = log10(df$meanEC50),
+       y = log10(df$totalMouseEC50),
+       xlab = "log10(invitro EC50)",
+       ylab = "log10(unbound Mouse EC50)",
+       main = assay,
+       sub = paste0("R =", sqrt(signif(summary(mod)$r.squared, 3))))
+    summary(mod)$coefficients %>% 
+    as.data.frame() %>% 
+    rownames_to_column("param") %>% 
+    mutate(rsq = summary(mod)$r.squared,
+           p.val = summary(mod)$`Pr(>|t|)`,
+           assayType = assay) }else {
+  plot(x = log10(df$meanEC50),
+       y = log10(df$totalMouseEC50),
+       xlab = "log10(invitro EC50)",
+       ylab = "log10(unbound Mouse EC50)",
+       main = assay,
+       sub = paste0("R =", sqrt(signif(summary(mod)$r.squared, 3))))
+  abline(lm(log10(totalMouseEC50)~ log10(meanEC50), data = df))
+
+  }
+    
+  }
+  ) 
+}
+```
+
+## acute univariate regression
+
+```{r}
+acute_indivLm <- univarLm_df("Acute")
+acute_indivLm %>% 
+  arrange(`Pr(>|t|)`)
+```
+
+## subacute univariate regression
+
+```{r}
+Subacute_indivLm <- univarLm_df("Subacute")
+Subacute_indivLm %>% 
+  arrange(`Pr(>|t|)`)
+
+```
+
+## chronic univariate regression
+
+```{r}
+Chronic_indivLm <- univarLm_df("Chronic")
+Chronic_indivLm %>% 
+  arrange(`Pr(>|t|)`)
+
+```
+
+## data availability as heatmap
+
+```{r}
+library(pheatmap)
+save_pheatmap_pdf <- function(x, filename, width=7, height=7) {
+   stopifnot(!missing(x))
+   stopifnot(!missing(filename))
+   pdf(filename, width=width, height=height, onefile = F)
+   grid::grid.newpage()
+   grid::grid.draw(x$gtable)
+   dev.off()
+}
+
+m <- matrix(c(rnorm(1000)), ncol=100)
+distmat <- dist(t(m))
+
+my.breaks <- c(seq(-3, 4, by=0.1), seq(4.1, 6, by=0.1)) 
+my.colors <- c(colorRampPalette(colors = c("cornflowerblue", "bisque2", "brown1"))(length(seq(-3, 4, by=0.1))), 
+               colorRampPalette(colors = c("white", "white"))(length(seq(4.1, 6, by=0.1))))
+regDf %>% 
+  ungroup() %>% 
+  dplyr::select(DrugName, assayType, meanEC50_uM)  %>% 
+  distinct() %>% 
+  drop_na() %>% 
+  mutate(meanEC50_uM = if_else(meanEC50_uM > 1000, 9999, meanEC50_uM),
+         meanEC50_uM= log10(meanEC50_uM)) %>% 
+  spread(assayType,meanEC50_uM)  %>% 
+  column_to_rownames("DrugName") %>% 
+  as.matrix() %>% 
+  replace(., is.na(.), 6) %>% 
+  t() %>% 
+  pheatmap(
+           angle_col = 45,
+           color = my.colors,
+            breaks = unique(my.breaks),
+           cellwidth = 12,
+          cellheight = 9, 
+          fontsize = 8,
+          treeheight_row = 10,
+          treeheight_col = 10) 
+
+```
+
+## get only complete assays 
+https://www.rpubs.com/Steven_Surya/correlation-network 
+```{r}
+completeAssays <- regDf %>% 
+  dplyr::select(DrugName, assayType, meanEC50) %>% 
+  distinct() %>% 
+  arrange(assayType)%>% 
+  group_by(assayType) %>% 
+  mutate(
+         total_drugs = n(),
+         prop_noData = 1-total_drugs/10
+         ) %>%
+  ungroup() %>% 
+  filter(prop_noData < 0.5 & 
+           total_drugs > 3) %>% 
+  pull(assayType) %>% 
+  unique()
+```
+
+## Fig 2c. pairwise correlations 
+
+```{r}
+pairwiseCor<- 
+regDf %>% 
+  dplyr::select(DrugName, assayType, meanEC50) %>% 
+  distinct() %>% 
+  filter(assayType %in% completeAssays) %>% 
+   rename(EC50 = meanEC50) %>% 
+    #filter(EC50 < 1000) %>% 
+  spread(key = assayType, value = EC50) %>% 
+      column_to_rownames("DrugName") %>% 
+    log10() %>% 
+   corrr::correlate(use = "pairwise.complete.obs") %>%  # correlate() is equivalent to cor() but                                                put NA as its diagonal entry and different class
+   corrr::shave(upper = TRUE) %>%            # Shave the data frame to lower triangular matrix
+  corrr::stretch(na.rm = TRUE)          
+
+
+options(ggrepel.max.overlaps = 100)
+vert <- pairwiseCor %>%
+  filter(abs(r) > 0.90) %>% 
+  mutate(type = case_when(r > 0.90 ~ "pos",
+                          r < c(-0.90) ~ "neg",
+                          T ~ "none"),
+         keep = if_else(type != "none", 1, 0),
+         type = factor(type, levels = c("pos", "neg", "none") %>%
+                                        unique())) %>%
+  group_by(x) %>% 
+  mutate(NHighCor = n()) 
+pairwiseCor %>%
+    filter(abs(r) > 0.90) %>% 
+  mutate(type = case_when(r > 0.90 ~ "pos",
+                          r < c(-0.90) ~ "neg",
+                          T ~ "none"),
+         keep = if_else(type != "none", 1, 0),
+         type = factor(type, levels = c("pos", "neg", "none") %>%
+                                        unique())) %>%
+  group_by(x) %>% 
+  mutate(NHighCor = n()) 
+  #graph_from_literal() %>% 
+ 
+links <- pairwiseCor %>%
+    filter(abs(r) > 0.90) 
+
+network <- igraph::graph_from_data_frame(d=links, directed=F) 
+ 
+# Count the number of degree for each node:
+deg <- igraph::degree(network, mode="all")
+
+plot(network, vertex.size=deg, vertex.color=rgb(0.1,0.7,0.8,0.5) )
+
+
+
+```
+
+## Fig 2b. cor cor plot 1
+
+```{r}
+
+corMatrixInvitro <- regDf %>% 
+                        dplyr::select(DrugName, assayType,  meanEC50) %>% 
+                        distinct() %>% 
+                        filter(assayType %in% completeAssays) %>% 
+                         rename(EC50 = meanEC50) %>% 
+                        spread(key = assayType, value = EC50) %>% 
+                            column_to_rownames("DrugName") %>% 
+                          log10() %>% 
+                          correlate(use = "pairwise.complete.obs") %>% 
+                          column_to_rownames("term") %>% 
+                         mutate_all(~replace_na(.,1))
+                
+
+invitroCor.breaks <- c(seq(-0.2, 0, by=0.01), 
+                       seq(0, 0.2, by = 0.01),
+                       seq(0.2, 0.4, by = 0.01),
+                       seq(0.4, 0.6, by = 0.01),
+                       seq(0.6, 0.8, by = 0.01),
+                       seq(0.8, 1, by=0.01)) 
+invitroCor.colors <- c(colorRampPalette(
+                                      colors = c("cornflowerblue", "cornsilk"))
+                                      (length(seq(-0.2, 0, by=0.01))),
+                       colorRampPalette(
+                                      colors = c("cornsilk", "khaki"))
+                                      (length(seq(0, 0.2, by=0.01))),
+                       colorRampPalette(
+                                      colors = c("khaki", "orange"))
+                                      (length(seq(0.2, 0.4, by=0.01))),
+                       colorRampPalette(
+                                      colors = c("orange", "orangered"))
+                                      (length(seq(0.4, 0.6, by=0.01))),
+                       colorRampPalette(
+                                      colors = c("orangered", "red"))
+                                      (length(seq(0.6, 0.8, by=0.01))),
+                       colorRampPalette(
+                                      colors = c("red", "brown4"))
+                                      (length(seq(0.6, 0.8, by=0.01)))
+                                        )
+dev.off()
+                      
+corMatrixInvitro %>% 
+  as.matrix() %>% 
+  #replace(., is.na(.), 2) %>% 
+  pheatmap(
+  #cutree_cols = 4, 
+  #          cutree_rows = 2,
+           angle_col = 90,
+           color = invitroCor.colors,
+            breaks = unique(invitroCor.breaks),
+             cellwidth = 9,
+          cellheight = 9, 
+          fontsize = 8,
+          treeheight_row = 10,
+          treeheight_col = 10
+           ) 
+
+```
+
+## choosing  assays lowCorAssays
+
+```{r}
+highCorAssays <- pairwiseCor %>%
+                filter(abs(r) > 0.90)
+highCorPairs <- pairwiseCor %>%
+                filter(abs(r) > 0.90) %>% 
+                  dplyr::select(x, y) %>% 
+                  distinct()
+highCorAssaysToRemove <-highCorAssays %>% 
+  gather(key = assayPair, value = assay,  -r) %>% 
+  group_by(assay) %>% 
+  mutate(NEdges = n()) %>% 
+  filter(NEdges <= 6) %>% 
+  pull(assay) %>% unique()
+highCorAssaysToRemove <- 
+  highCorAssaysToRemove[!highCorAssaysToRemove %in% c("Assay001", "Assay002")]
+lowCorAssays <- 
+regDf %>%
+  filter(assayType %in% completeAssays) %>%
+  filter(!assayType %in% highCorAssaysToRemove) %>% 
+  pull(assayType) %>% 
+  unique()
+  
+``` 
+
+## counting number of edges 
+Table 1 
+```{r, eval = F}
+tmp <- deg %>% 
+  as.data.frame() %>% 
+  rownames_to_column("assayType") %>% 
+  rename(NEdges = ".") %>% 
+  arrange(-NEdges) %>%
+  filter(NEdges >=6) %>% 
+  pull(assayType)
+
+regDf %>% 
+  dplyr::select(DrugName, assayType, meanEC50) %>% 
+  distinct() %>% 
+  filter(assayType %in% completeAssays) %>% 
+   rename(EC50 = meanEC50) %>% 
+    #filter(EC50 < 1000) %>% 
+  spread(key = assayType, value = EC50) %>% 
+      column_to_rownames("DrugName") %>% 
+    log10() %>% 
+   correlate(use = "pairwise.complete.obs") %>%  # correlate() is equivalent to cor() but                                                put NA as its diagonal entry and different class
+   #shave(upper = TRUE) %>%            # Shave the data frame to lower triangular matrix
+  stretch(na.rm = TRUE)  %>% 
+  filter(abs(r) > 0.9) %>% 
+  filter(x %in% tmp) 
+```
+
+## plotting high correlations for 10 drugs
+
+```{r}
+
+highCorPlots <- lapply(unique(highCorPairs$x), function(assay.idx){
+  print(assay.idx)
+  assay_x <- highCorPairs %>% 
+            filter(x ==assay.idx) %>% 
+            pull(x) %>% 
+            unique()
+  assay_y <- highCorPairs %>% 
+            filter(x ==assay.idx) %>% 
+            pull(y) %>% 
+            unique()
+  
+  df_x <- regDf %>% 
+            dplyr::select(DrugName, assayType, meanEC50) %>% 
+            distinct() %>% 
+              filter(assayType %in% assay_x) %>% 
+              mutate(meanEC50 = log10(meanEC50)) %>% 
+              drop_na()
+    
+  
+  df_y <- regDf %>% 
+            dplyr::select(DrugName, assayType, meanEC50) %>% 
+            distinct() %>% 
+              filter(assayType %in% assay_y) %>% 
+              mutate(meanEC50 = log10(meanEC50)) %>% 
+              drop_na() 
+   name.index <- regDf %>% 
+                  dplyr::select(assayType) %>% 
+                  distinct()
+ df <-  df_x %>% 
+    inner_join(df_y, by = "DrugName") %>% 
+    left_join(pairwiseCor %>% 
+                filter(x == assay.idx) %>% 
+                dplyr::select(-x), 
+              by = c("assayType.y" = "y")) %>% 
+    left_join(name.index, by = c("assayType.x" = "assayType")) %>% 
+    rename(assayName_x = assayType) %>% 
+    left_join(name.index, by = c("assayType.y" = "assayType")) %>% 
+    rename(assayName_y = assayType)
+ lapply(unique(df$assayType.y), function(assay.y.idx){
+   print(assay.y.idx)
+   plotdf <- df %>% 
+              filter(assayType.y == assay.y.idx)
+   
+   x_label <- paste0(plotdf$assayName_x %>% unique(), " EC50 (mg/L)")
+   y_label <- paste0(plotdf$assayName_y %>% unique(), " EC50 (mg/L)")
+   rval <- plotdf$r %>% unique()
+   plotdf %>% 
+              ggplot(aes(x = invitroEC50.x, y = invitroEC50.y))+
+                geom_point()+
+                geom_smooth(method = "lm", se = F)+
+                theme_bw()+
+                
+                xlab(x_label)+
+                ylab(y_label)+
+                annotate(geom = 'text', label = paste0("R=", signif(rval, 3)), x = -Inf, y = Inf, hjust = -0.2, vjust = 2)+
+                theme(text = element_text(size = 6))
+         
+ })
+    
+})
+
+
+
+```
+
+## plot all univar correlations in vitro vs in vivo
+
+```{r}
+library(patchwork)
+library(ggbreak) 
+allUniVarPlot_function <- function(model.idx){
+  lapply(unique(completeAssays), function(assay){
+  print(assay)
+  df <- regDf %>% 
+        filter(assayType == assay &
+               ModelType == model.idx &
+                 meanEC50 < 1000)
+    outliers <- regDf %>% 
+        filter(assayType == assay &
+               ModelType == model.idx &
+                 meanEC50 >= 1000)
+    assayName = df$assayType %>% unique()
+  if(nrow(df)<3){
+    ggplot(data = df, aes(x = log10(meanEC50), y = log10(totalMouseEC50)))+
+      geom_point()+
+     theme_bw()+
+    labs(title = assayName,
+         subtitle = paste0("R=NA", " Pval=NA"))+
+    theme(panel.grid = element_blank(),
+          axis.text.x = element_text(size = 8),
+          axis.text.y = element_text(size = 8),
+          plot.title = element_text(size = 8,
+                                    margin=margin(0,0,0,0)),
+          plot.subtitle = element_text(size = 8,
+                                       margin=margin(0,0,0,0)),
+          plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))+
+    xlab("")+
+    ylab("")+
+    scale_y_continuous(labels = scales::number_format(accuracy = 0.1))
+  }else{
+
+  mod <- lm(log10(totalMouseEC50)~ log10(meanEC50), data = df)
+  tmp <- summary(mod)
+  cor <- cor.test(log10(df$totalMouseEC50), log10(df$meanEC50))$estimate
+  
+  ggplot(data = df, aes(x = log10(meanEC50), y = log10(totalMouseEC50)))+
+    geom_point()+
+    geom_smooth(method = "lm", se = F)+
+     theme_bw()+
+    labs(title = assayName,
+         subtitle = paste0("R=", signif(cor, 3), " Pval=", signif(tmp$coefficients[2,4], 3)))+
+    theme(panel.grid = element_blank(),
+          axis.text.x = element_text(size = 8),
+          axis.text.y = element_text(size = 8),
+          plot.title = element_text(size = 8,
+                                    margin=margin(0,0,0,0)),
+          plot.subtitle = element_text(size = 8,
+                                       margin=margin(0,0,0,0)),
+          plot.margin = unit(c(0.1,0.1,0.1,0.1), "cm"))+
+    xlab("")+
+    ylab("")+
+    scale_y_continuous(labels = scales::number_format(accuracy = 0.1))
+}
+  })
+}
+acute_uniVar  <- allUniVarPlot_function("Acute")
+subacute_uniVar  <- allUniVarPlot_function("Subacute")
+chronic_uniVar  <- allUniVarPlot_function("Chronic")
+
+```
+
+
+## data frame for univar correlation against in vivo for 10 drugs
+
+```{r}
+univarLm_df <- function(model.idx){
+   lapply(unique(completeAssays), function(assay){
+  print(assay)
+  df <- regDf %>% 
+        filter(assayType == assay &
+               ModelType == model.idx &
+                 meanEC50 < 1000)
+  mod <- try(lm(log10(totalMouseEC50)~ log10(meanEC50), data = df))
+
+  if(df$meanEC50 %>% unique() %>% length() == 1 |nrow(df) <=2){
+
+    tibble(param = c("(Intercept)", "log10(meanEC50)"),
+           Estimate = 0,
+           stdErr = NA,
+           t.val = NA,
+           p.val = NA,
+           rsq = 0,
+           assayType = assay,
+           Ndata = nrow(df)) }else {
+             
+    summary(mod)$coefficients %>% 
+    as.data.frame() %>% 
+    rownames_to_column("param") %>% 
+    mutate(rsq = summary(mod)$r.squared,
+           p.val = summary(mod)$`Pr(>|t|)`,
+           assayType = assay,
+           Ndata = nrow(df))%>% 
+    rename(stdErr = `Std. Error`,
+           t.val = `t value`,
+           p.val = `Pr(>|t|)`) 
+  }
+    
+  }
+  ) %>% do.call(rbind,.) %>% 
+  filter(param == "log10(meanEC50)")
+}
+
+acute_univar <- univarLm_df(("Acute"))
+subacute_univar <- univarLm_df(("Subacute"))
+chronic_univar <- univarLm_df(("Chronic"))
+```
+
+## plot univar correlations against assays 
+```{r}
+allUniVar <- bind_rows(acute_univar %>% 
+            dplyr::select(rsq, assayType, p.val, Estimate) %>% 
+            mutate(modelType = "Acute"),
+          subacute_univar %>% 
+            dplyr::select(rsq, assayType, p.val, Estimate)%>% 
+            mutate(modelType = "Subacute"),
+          chronic_univar %>% 
+            dplyr::select(rsq, assayType, p.val, Estimate)%>% 
+            mutate(modelType = "Chronic"))
+
+```
+
+
+
+```{r}
+allAssayCor <- regDf %>% 
+  ungroup() %>% 
+  filter(assayType %in% lowCorAssays & meanEC50 < 1000)  %>% 
+  group_by(assayType, ModelType) %>% 
+  mutate(r = cor(log10(meanEC50), log10(totalMouseEC50))) %>% 
+  dplyr::select(assayType, ModelType, r) %>% 
+  distinct()
+regDf %>% 
+  filter(assayType %in% lowCorAssays) %>% 
+  left_join(allAssayCor, by = c("assayType", "ModelType")) %>% 
+  mutate(ModelType = factor(ModelType, levels = c("Acute", "Subacute", "Chronic")),
+         activity = if_else(meanEC50 >1000, "inactive", "active")) %>% 
+ggplot(aes(x = log10(meanEC50), y = log10(totalMouseEC50)))+
+  geom_point(aes(col = activity))+
+  geom_text(aes(label = DrugName, hjust = 1), size = 2)+
+  geom_abline(aes(slope =1 , intercept = 0), linetype = "dashed")+
+  facet_grid(reorder(assayType, -r)~ModelType, scales = "free")+ 
+  theme_bw()+
+  xlim(-5, 5)+
+  ylim(-5,5)
+  
+
+```
+
+
+## create new combos with low cor for 10 drugs
+permutation feature importance 
+```{r}
+combodf5_lowCorAssays <- combn(lowCorAssays, 5)
+combodf4_lowCorAssays <- combn(lowCorAssays, 4)
+combodf3_lowCorAssays <- combn(lowCorAssays, 3)
+combodf2_lowCorAssays <- combn(lowCorAssays, 2)
+combodf1_lowCorAssays <- combn(lowCorAssays, 1)
+combo_indexAll_lowCorAssays <- bind_rows(combodf1_lowCorAssays %>%
+                                      t() %>%
+                                      as.data.frame %>%
+                                      rownames_to_column("comboNo") %>%
+                                      mutate(comboNo = as.numeric(comboNo),
+                                             assayN = 1),
+                                    combodf2_lowCorAssays %>%
+                                      t() %>%
+                                      as.data.frame %>%
+                                      rownames_to_column("comboNo") %>%
+                                      mutate(comboNo = as.numeric(comboNo),
+                                             assayN = 2),
+                                    combodf3_lowCorAssays  %>%
+                                      t() %>%
+                                      as.data.frame %>%
+                                      rownames_to_column("comboNo") %>%
+                                      mutate(comboNo = as.numeric(comboNo),
+                                             assayN = 3),
+                                    combodf4_lowCorAssays %>%
+                                      t() %>%
+                                      as.data.frame %>%
+                                      rownames_to_column("comboNo") %>%
+                                      mutate(comboNo = as.numeric(comboNo),
+                                             assayN = 4),
+                                    combodf5_lowCorAssays %>%
+                                      t() %>%
+                                      as.data.frame %>%
+                                      rownames_to_column("comboNo") %>%
+                                      mutate(comboNo = as.numeric(comboNo),
+                                             assayN = 5)) %>% 
+                              dplyr::select(comboNo, assayN, V1, V2, V3, V4 ,V5)
+
+```
+
+
+## retrain with all combinations again
+
+```{r}
+selBestCombos_LOOCV <- function(model.idx, combo.dataframe){
+  lapply(c(1:ncol(combo.dataframe)), function(combo.idx){
+    combo <- combo.dataframe[, combo.idx]
+    df <- regDf %>% 
+      rename(mouseEC50 = totalMouseEC50) %>% 
+    filter(ModelType == model.idx &
+             assayType %in% combo) %>% 
+                  mutate(MouseEC50_cat  = case_when(mouseEC50 <0.1 ~ 1,
+                                                    mouseEC50 >=0.1 & mouseEC50 < 1 ~ 2,
+                                                    mouseEC50 >= 1 & mouseEC50< 10 ~ 3,
+                                                    mouseEC50 >=10 & mouseEC50 < 100~ 4),
+                         invitroEC50 = log10(invitroEC50)) %>% 
+          ungroup() %>% 
+          dplyr::select(Drug, MouseEC50_cat, assayType, invitroEC50, mouseEC50) %>% 
+          left_join(drugKey_numeric, by = "Drug") %>% 
+          spread(key = assayType, value = invitroEC50) %>% 
+          dplyr::select(-c(mouseEC50, Drug))%>% 
+
+          na.aggregate() %>% 
+          mutate(MouseEC50_cat = case_when(MouseEC50_cat == 1 ~ "verylow",
+                                           MouseEC50_cat == 2 ~ "low",
+                                           MouseEC50_cat == 3 ~ "mid",
+                                           MouseEC50_cat == 4 ~ "high"),
+                 MouseEC50_cat = factor(MouseEC50_cat, levels = c("verylow", "low", "mid", "high"))) 
+    print(paste("mod", model.idx, "combo", combo.idx))
+categorical_LOOCV <- lapply(df$DrugNumber, function(drugNo){
+                              print(paste("drugNo", drugNo))
+                             train <- df %>% 
+                                      filter(DrugNumber!= drugNo) %>% 
+                                      dplyr::select(-c(DrugNumber))
+                                    mod <- try(multinom(MouseEC50_cat~., data = train))
+                                    if(class(mod) != "try-error"){ 
+                                      preddf <- tibble(pred = as.character(predict(mod, df[,-c(1,2)])),
+                                                     actual = df %>% pull(MouseEC50_cat) %>% as.character(),
+                                                     DrugNumber = df$DrugNumber) %>% 
+                                      mutate(accuracy = if_else(pred == actual, 1, 0)) %>% 
+                                      filter(DrugNumber == drugNo) %>% 
+                                      left_join(drugKey_numeric, by = c("DrugNumber"))
+                                    } else {
+                                      preddf <- tibble(pred = NA,
+                                                     actual = df %>% pull(MouseEC50_cat) %>% as.character(),
+                                                     DrugNumber = df$DrugNumber) %>% 
+                                      mutate(accuracy = if_else(pred == actual, 1, 0)) %>% 
+                                      filter(DrugNumber == drugNo) %>% 
+                                      left_join(drugKey_numeric, by = c("DrugNumber"))
+                                      }
+                                   
+                                    preddf
+                              })%>% 
+                              do.call(rbind,.) %>% 
+                              mutate(comboNo = combo.idx,
+                                     accuracy = if_else(is.na(accuracy), 0 , accuracy)) 
+   
+  }) %>% do.call(rbind,.) 
+  
+}
+```
+
+## example script for cluster run
+
+```{r, eval = F}
+## assay combos for Cluster
+
+library(dplyr)
+library(tidyr)
+library(zoo)
+library(rsample)
+library(nnet)
+
+
+load("20230509_13combosForWynton.Rdata")
+set.seed(42)
+acute_6assays_lowCor<- selBestCombos_LOOCV("Acute", combodf6_lowCorAssays)
+subacute_6assays_lowCor <- selBestCombos_LOOCV("Subacute", combodf6_lowCorAssays)
+chronic_6assays_lowCor <- selBestCombos_LOOCV("Chronic", combodf6_lowCorAssays)
+assays6_all <- bind_rows(acute_6assays_lowCor %>% mutate(modelType = "Acute") ,
+                         subacute_6assays_lowCor %>% mutate(modelType = "Subacute"),
+                         chronic_6assays_lowCor %>% mutate(modelType = "Chronic"))
+saveRDS(assays6_all, "assays6_all_13Combos.rds")
+
+set.seed(42)
+acute_5assays_lowCor<- selBestCombos_LOOCV("Acute", combodf5_lowCorAssays)
+subacute_5assays_lowCor <- selBestCombos_LOOCV("Subacute", combodf5_lowCorAssays)
+chronic_5assays_lowCor <- selBestCombos_LOOCV("Chronic", combodf5_lowCorAssays)
+assays5_all <- bind_rows(acute_5assays_lowCor %>% mutate(modelType = "Acute") ,
+                          subacute_5assays_lowCor %>% mutate(modelType = "Subacute"),
+                          chronic_5assays_lowCor %>% mutate(modelType = "Chronic"))
+saveRDS(assays5_all, "assays5_all_13Combos.rds")
+
+set.seed(42)
+acute_4assays_lowCor<- selBestCombos_LOOCV("Acute", combodf4_lowCorAssays)
+subacute_4assays_lowCor <- selBestCombos_LOOCV("Subacute", combodf4_lowCorAssays)
+chronic_4assays_lowCor <- selBestCombos_LOOCV("Chronic", combodf4_lowCorAssays)
+assays4_all <- bind_rows(acute_4assays_lowCor %>% mutate(modelType = "Acute") ,
+                          subacute_4assays_lowCor %>% mutate(modelType = "Subacute"),
+                          chronic_4assays_lowCor %>% mutate(modelType = "Chronic"))
+saveRDS(assays4_all, "assays4_all_13Combos.rds")
+```
+
+## load cluster run for 10 compounds
+
+```{r}
+assayCombos <- list.files("", pattern = "assayCombos_*")
+all_assays_10Drugs<-  lapply(assayCombos, function(x) {
+  readRDS(paste0("", x)) %>% 
+    mutate(assayN = gsub("assayCombos_", "", x) %>% 
+                    gsub(".rds", "",.))
+}) %>% 
+  do.call(rbind,. ) %>% 
+  mutate(assayN = as.numeric(assayN))
+```
+
+## plot 2bin accuracy by assays 10 drugs
+
+```{r}
+all_assays_10Drugs %>%
+  mutate(twoBinClassification_pred = case_when(pred %in% c("low", "verylow") ~ "low",
+                                               pred %in% c("mid", "high") ~ "high"),
+         twoBinClassification_actual = case_when(actual %in% c("low", "verylow") ~ "low",
+                                               actual %in% c("mid", "high") ~ "high"),
+         twoBinaccuracy = if_else(twoBinClassification_pred == twoBinClassification_actual, 1, 0)) %>% 
+group_by(modelType, comboNo, assayN) %>% 
+  summarize(mean_accuracy = mean(accuracy),
+            mean2bin_accuracy = mean(twoBinaccuracy)) %>% 
+  ungroup() %>% 
+   filter(assayN <=5) %>% 
+  mutate(modelType = factor(modelType, levels = c("Acute", "Subacute", "Chronic")),
+         assayN =as.numeric(assayN))  %>% 
+  filter(modelType == "Subacute") %>% 
+  rename(fourBins = mean_accuracy,
+         twoBins = mean2bin_accuracy) %>% 
+  gather(key = binSize, value = accuracy, fourBins, twoBins) %>% 
+  group_by(binSize, assayN) %>% 
+  top_n(1, accuracy) %>% 
+  
+  ggplot(aes(x = assayN, y = accuracy, group = binSize, col = binSize))+
+  geom_point()+
+  geom_line()+
+    ylim(0.5, 1)+
+  scale_x_continuous(breaks = seq(1, 14, by = 1))+
+  theme_bw()+
+  ylab("accuracy with 2 bins")+
+  xlab("number of assays in combination") +
+  theme(panel.grid = element_blank(),
+        legend.position = "bottom",
+        text = element_text(size = 8))+
+  scale_color_manual(values=c("#999999", "#E69F00", "#56B4E9"))
+
+```
+
+## plot 4bin accuracy by assays 10 drugs
+
+```{r}
+all_assays_10Drugs %>%
+  mutate(twoBinClassification_pred = case_when(pred %in% c("low", "verylow") ~ "low",
+                                               pred %in% c("mid", "high") ~ "high"),
+         twoBinClassification_actual = case_when(actual %in% c("low", "verylow") ~ "low",
+                                               actual %in% c("mid", "high") ~ "high"),
+         twoBinaccuracy = if_else(twoBinClassification_pred == twoBinClassification_actual, 1, 0)) %>% 
+group_by(modelType, comboNo, assayN) %>% 
+  summarize(mean_accuracy = mean(accuracy),
+            mean2bin_accuracy = mean(twoBinaccuracy)) %>% 
+  ungroup() %>% 
+  group_by(modelType, assayN) %>% 
+  filter(assayN <=5) %>% 
+  top_n(1, mean_accuracy) %>% 
+  mutate(modelType = factor(modelType, levels = c("Acute", "Subacute", "Chronic")),
+         assayN = as.numeric(assayN)) %>% 
+  
+  ggplot(aes(x = assayN, y = mean_accuracy, group = modelType, col = modelType))+
+  geom_point()+
+  geom_line()+
+  ylim(0.5, 1)+
+  theme_bw()+
+  scale_x_continuous(breaks = seq(1, 15, by = 1))+
+  ylab("accuracy with 4 bins")+
+  xlab("number of assays in combination") +
+  theme(panel.grid = element_blank(),
+        legend.position = "bottom",
+        text = element_text(size = 8))+
+  scale_color_manual(values=c("#999999", "#E69F00", "#56B4E9"))
+
+```
+
+## get best combos for 10 drugs
+
+```{r}
+best_combos_10drugs <- all_assays_10Drugs %>%
+group_by(modelType, comboNo, assayN) %>% 
+  summarize(mean_accuracy = mean(accuracy)) %>% 
+  ungroup() %>% 
+  filter(assayN <=4) %>% 
+  mutate(keep = case_when(modelType == "Acute" & mean_accuracy > 0.7 ~ 1,
+                          modelType == "Subacute" & mean_accuracy > 0.5 ~ 1,
+                          modelType == "Chronic"& mean_accuracy > 0.7 ~ 1,
+                          T ~ 0)) %>% 
+  filter(keep == 1) %>% 
+  unite(combo, modelType, comboNo, assayN, sep = "_") %>% 
+  pull(combo)
+```
+
+## get assays to do 10 drugs
+
+```{r}
+all_assays_10Drugs%>%
+  filter(assayN ==1) %>% 
+  mutate(twoBinClassification_pred = case_when(pred %in% c("low", "verylow") ~ "low",
+                                               pred %in% c("mid", "high") ~ "high"),
+         twoBinClassification_actual = case_when(actual %in% c("low", "verylow") ~ "low",
+                                               actual %in% c("mid", "high") ~ "high"),
+         twoBinAccuracy = if_else(twoBinClassification_pred == twoBinClassification_actual, 1, 0))  %>% 
+group_by(modelType, comboNo, assayN) %>% 
+  summarize(mean_accuracy = mean(accuracy),
+            meanTwoBinaccuracy = mean(twoBinAccuracy)) %>% 
+  ungroup() %>% 
+  group_by(modelType) %>%
+  mutate(keep = case_when(modelType == "Acute" & mean_accuracy > 0.7 ~ 1,
+                          modelType == "Subacute" & mean_accuracy > 0.7 ~ 1,
+                          modelType == "Chronic"& mean_accuracy > 0.7 ~ 1,
+                          T ~ 0)) %>%
+  filter(keep == 1) %>%
+  mutate(assayN = as.numeric(assayN)) %>% 
+   left_join(combo_indexAll_lowCorAssays, by= c("assayN", "comboNo")) %>% View()
+```
+
+manual decision to get 
+acute 
+  comboNo 80, assayN 2
+  comboNo 58, assayN 2
+  comboNo 335, assayN 2 
+  
+Subacute 
+  comboNo 13, assayN 1 
+  comboNo 438, assayN 3 
+  comboNo 918, assayN 4 
+  
+Chronic 
+  comboNo 295, assayN 3 
+  comboNo 299, assayN 3,
+  comboNo 3, assayN 1 
+  comboNo 6, assayN 1
+## get all assays across models
+
+```{r}
+bestPerfAssays10Drugs <- all_assays_10Drugs %>% 
+  mutate(predNo = case_when(pred == "verylow" ~ 1, 
+                            pred == "low" ~ 2, 
+                            pred == "mid" ~ 3, 
+                            pred == "high" ~ 4),
+         actualNo = case_when(actual == "verylow" ~ 1, 
+                            actual == "low" ~ 2, 
+                            actual == "mid" ~ 3, 
+                            actual == "high" ~ 4),
+         classificationScore = abs(predNo -actualNo)) %>% 
+  group_by(comboNo, modelType, assayN) %>% 
+  summarize(classScoreTotal = sum(classificationScore),
+            mean_accuracy = mean(accuracy)) %>% 
+  ungroup()  %>% 
+  left_join(combo_indexAll_lowCorAssays, by= c("assayN", "comboNo")) %>% 
+  mutate(keep = case_when(modelType == "Acute" & comboNo == 80 & assayN == 2 ~ 1, 
+                          modelType == "Acute" & comboNo == 58 & assayN == 2 ~ 1, 
+                          modelType == "Acute" & comboNo == 335 & assayN == 3 ~ 1, 
+                          modelType == "Subacute" & comboNo == 13 & assayN == 1 ~ 1, 
+                          modelType == "Subacute" & comboNo == 438 & assayN == 3 ~ 1, 
+                          modelType == "Subacute" & comboNo == 918 & assayN == 4 ~ 1, 
+                          modelType == "Chronic" & comboNo == 295 & assayN == 3 ~ 1, 
+                          modelType == "Chronic" & comboNo == 299 & assayN == 3 ~ 1,
+                          modelType == "Chronic" & comboNo == 3 & assayN == 1 ~ 1, 
+                          modelType == "Chronic" & comboNo == 6 & assayN == 1 ~ 1,
+                          T ~ 0)) %>% 
+  filter(keep == 1) %>% 
+  dplyr::select(V1, V2, V3, V4) %>% 
+  gather() %>% 
+  drop_na() %>% 
+  pull(value) %>% 
+  unique()
+
+
+```
+
+## LOOCV for 10 drugs in best performing combinations 
+
+```{r}
+initialLOOCVPlots <- lapply(c("Acute", "Subacute", "Chronic"), function(model.idx){
+   all_assays_10Drugs %>% 
+  left_join(combo_indexAll_lowCorAssays, by= c("assayN", "comboNo")) %>% 
+  mutate(keep = case_when(modelType == "Acute" & comboNo == 80 & assayN == 2 ~ 1, 
+                          modelType == "Acute" & comboNo == 58 & assayN == 2 ~ 1, 
+                          modelType == "Acute" & comboNo == 335 & assayN == 3 ~ 1, 
+                          modelType == "Subacute" & comboNo == 13 & assayN == 1 ~ 1, 
+                          modelType == "Subacute" & comboNo == 438 & assayN == 3 ~ 1, 
+                          modelType == "Subacute" & comboNo == 918 & assayN == 4 ~ 1, 
+                          modelType == "Chronic" & comboNo == 295 & assayN == 3 ~ 1, 
+                          modelType == "Chronic" & comboNo == 299 & assayN == 3 ~ 1,
+                          modelType == "Chronic" & comboNo == 3 & assayN == 1 ~ 1, 
+                          modelType == "Chronic" & comboNo == 6 & assayN == 1 ~ 1,
+                          T ~ 0)) %>% 
+  filter(keep == 1) %>% 
+  unite(comboID, V1, V2, V3, V4, sep = "+")%>% 
+  mutate(comboID = gsub("+NA", "", comboID, fixed = TRUE) %>% 
+                   gsub("\\+++", "",., fixed = TRUE)) %>%
+   left_join(combinedRegDf  %>%
+              dplyr::select(Drug, ModelType, mouseEC50) %>% 
+              distinct(),
+            by = c("Drug", "modelType" = "ModelType"))  %>% 
+  dplyr::select(-c(V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15)) %>% 
+  mutate(binnedEC50 = case_when(pred == "high" ~ 50,
+                                pred == "mid" ~ 5,
+                                pred == "low" ~ 0.5,
+                                pred == "verylow" ~ 0.05),
+          uppBin = case_when(pred == "high" ~ 100,
+                                pred == "mid" ~ 10,
+                                pred == "low" ~ 1,
+                                pred == "verylow" ~ 0.1),
+          lowBin = case_when(pred == "high" ~ 10,
+                                pred == "mid" ~ 1,
+                                pred == "low" ~ 0.1,
+                                pred == "verylow" ~ 0.01))  %>% 
+  mutate(modelType = factor(modelType, levels = c("Acute", "Subacute", "Chronic"))) %>% 
+    filter(modelType == model.idx) %>% 
+    mutate(comboID = gsub("_", " ", comboID)) %>% 
+  ggplot(aes(x = binnedEC50, y = mouseEC50, col = as.factor(accuracy)))+
+  geom_point(size = 4)+
+  geom_errorbar(aes(xmin = lowBin, xmax = uppBin, col = as.factor(accuracy)), width = 0.2)+
+  ggrepel::geom_text_repel(aes(label = Drug),
+                  segment.linetype = 2,
+                  segment.alpha = 0.3,
+                  segment.color = "grey60")+
+  facet_grid(modelType~comboID)+
+  scale_x_log10(limits = c(0.00001, 100), labels = scales::comma, breaks = c(0.0001, 0.001, 0.01, 0.1, 1, 10, 100))+
+  scale_y_log10(limits = c(0.00001, 100), labels = scales::comma, breaks = c(0.0001, 0.001, 0.01, 0.1, 1, 10, 100))+
+  theme_bw()+
+  geom_abline(aes(slope = 1, intercept = 0), linetype = "dashed")+
+  theme(text = element_text(size = 8),
+        legend.position = "bottom",
+        panel.grid = element_blank())+
+  labs(col = "accuracy")
+})
+
+```
+
+
+# function for testing model predictions 
+** a separate dataframe is needed with new data 
+
+```{r}
+set.seed(42)
+testingModelPred <- function(model.idx, combo.idx, combodataframe){
+combo <- combodataframe[,combo.idx]
+  df <- regDf %>% 
+    filter(ModelType == model.idx &
+             assayType %in% combo) %>% 
+                  mutate(MouseEC50_cat  = case_when(mouseEC50 <0.1 ~ 1,
+                                                    mouseEC50 >=0.1 & mouseEC50 < 1 ~ 2,
+                                                    mouseEC50 >= 1 & mouseEC50< 10 ~ 3,
+                                                    mouseEC50 >=10 & mouseEC50 < 100~ 4),
+                         invitroEC50 = log10(invitroEC50)) %>% 
+          ungroup() %>% 
+          dplyr::select(Drug, MouseEC50_cat, assayType, invitroEC50, mouseEC50) %>% 
+          left_join(drugKey_numeric, by = "Drug") %>% 
+          spread(key = assayType, value = invitroEC50) %>% 
+          dplyr::select(-c(mouseEC50, Drug)) %>% 
+          na.aggregate() %>% 
+          mutate(MouseEC50_cat = case_when(MouseEC50_cat == 1 ~ "verylow",
+                                           MouseEC50_cat == 2 ~ "low",
+                                           MouseEC50_cat == 3 ~ "mid",
+                                           MouseEC50_cat == 4 ~ "high"),
+                 MouseEC50_cat = factor(MouseEC50_cat, levels = c("verylow", "low", "mid", "high"))) %>% 
+                                      dplyr::select(-c(DrugNumber))
+    allDf <- combinedRegDf%>% 
+    filter(ModelType == model.idx &
+             assayType %in% combo) %>% 
+                  mutate(MouseEC50_cat  = case_when(mouseEC50 <0.1 ~ 1,
+                                                    mouseEC50 >=0.1 & mouseEC50 < 1 ~ 2,
+                                                    mouseEC50 >= 1 & mouseEC50< 10 ~ 3,
+                                                    mouseEC50 >=10 & mouseEC50 < 100~ 4),
+                         invitroEC50 = log10(invitroEC50)) %>% 
+          ungroup() %>% 
+          dplyr::select(Drug, MouseEC50_cat, assayType, invitroEC50, mouseEC50) %>% 
+          left_join(drugKey_numeric, by = "Drug") %>%
+          spread(key = assayType, value = invitroEC50) %>% 
+          dplyr::select(-c(mouseEC50, Drug)) %>% 
+          na.aggregate() %>% 
+          mutate(MouseEC50_cat = case_when(MouseEC50_cat == 1 ~ "verylow",
+                                           MouseEC50_cat == 2 ~ "low",
+                                           MouseEC50_cat == 3 ~ "mid",
+                                           MouseEC50_cat == 4 ~ "high"),
+                 MouseEC50_cat = factor(MouseEC50_cat, levels = c("verylow", "low", "mid", "high"))) 
+      mod <- multinom(MouseEC50_cat~., data = df)
+      preddf <- tibble(pred = as.character(predict(mod, allDf[,-c(1,2)])),
+                                                     actual = allDf%>% pull(MouseEC50_cat) %>% as.character(),
+                                                     DrugNumber = allDf$DrugNumber) %>% 
+                                      mutate(accuracy = if_else(pred == actual, 1, 0)) %>% 
+                                      left_join(drugKey_numeric, by = c("DrugNumber"))
+    return(preddf)
+}
+
+
+```
+
+## testing best combos 
+
+manual decision to get 
+acute 
+  comboNo 80, assayN 2
+  comboNo 58, assayN 2
+  comboNo 385, assayN 3
+
+```{r}
+library(ggrepel)
+set.seed(42)
+testingSelCombos <- bind_rows(
+testingModelPred("Acute", 80, combodf2_lowCorAssays) %>% mutate(assayN =2, comboNo = 80, modelType = "Acute"),
+testingModelPred("Acute", 58, combodf2_lowCorAssays) %>% mutate(assayN =2, comboNo = 58, modelType = "Acute"),
+testingModelPred("Acute", 385, combodf3_lowCorAssays) %>% mutate(assayN =3, comboNo = 385, modelType = "Acute"),
+testingModelPred("Subacute", 918, combodf4_lowCorAssays) %>% mutate(assayN =4, comboNo = 918, modelType = "Subacute"),
+testingModelPred("Chronic", 295, combodf3_lowCorAssays) %>% mutate(assayN =3, comboNo = 295, modelType = "Chronic"),
+testingModelPred("Chronic", 299, combodf3_lowCorAssays) %>% mutate(assayN =3, comboNo = 299, modelType = "Chronic"),
+testingModelPred("Chronic", 3, combodf1_lowCorAssays) %>% mutate(assayN =1, comboNo = 3, modelType = "Chronic"),
+testingModelPred("Chronic", 6, combodf1_lowCorAssays) %>% mutate(assayN =1, comboNo = 6, modelType = "Chronic")
+) %>% 
+  mutate(DrugType = if_else(Drug %in% unique(regDf$Drug), "train", "test"),
+         pred = factor(pred, levels = c("verylow", "low","mid", "high")),
+         actual = factor(actual, levels = c("verylow", "low","mid", "high"))) %>% 
+  left_join(combo_indexAll_lowCorAssays, by = c("assayN", "comboNo")) %>% 
+  dplyr::select(-c(V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15)) %>% 
+  unite(comboID, assayN, comboNo, sep = "_") 
+newDrugPlots <- lapply(unique(testingSelCombos$comboID), function(combo.idx){
+  testingSelCombos %>% 
+    filter(comboID == combo.idx) %>% 
+       mutate(binnedEC50 = case_when(pred == "high" ~ 50,
+                                pred == "mid" ~ 5,
+                                pred == "low" ~ 0.5,
+                                pred == "verylow" ~ 0.05),
+          uppBin = case_when(pred == "high" ~ 100,
+                                pred == "mid" ~ 10,
+                                pred == "low" ~ 1,
+                                pred == "verylow" ~ 0.1),
+          lowBin = case_when(pred == "high" ~ 10,
+                                pred == "mid" ~ 1,
+                                pred == "low" ~ 0.1,
+                                pred == "verylow" ~ 0.01))%>% 
+  left_join(combinedRegDf  %>%
+              dplyr::select(Drug, ModelType, mouseEC50) %>% 
+              distinct(),
+            by = c("Drug", "modelType" = "ModelType")) %>% 
+    mutate(DrugType = case_when(DrugType == "train" ~ "Train",
+                                DrugType == "test" ~ "Test") %>% 
+             factor(., levels = c("Train", "Test"))) %>% 
+  ggplot(aes(x = binnedEC50, y = mouseEC50, col = as.factor(accuracy)))+
+  geom_point(size = 3)+
+  geom_errorbar(aes(xmin = lowBin, xmax = uppBin, col = as.factor(accuracy)), width = 0.2)+
+  geom_text_repel(aes(label = Drug),
+                  size = 2.75,
+                  segment.linetype = 2,
+                  segment.alpha = 0.3,
+                  segment.color = "grey60")+
+  facet_grid(~DrugType)+
+  scale_x_log10(limits = c(0.00001, 100), labels = scales::comma, breaks = c(0.0001, 0.001, 0.01, 0.1, 1, 10, 100))+
+  scale_y_log10(limits = c(0.00001, 100), labels = scales::comma, breaks = c(0.0001, 0.001, 0.01, 0.1, 1, 10, 100))+
+  theme_bw()+
+  geom_abline(aes(slope = 1, intercept = 0), linetype = "dashed")+
+  theme(text = element_text(size = 8), 
+        axis.text.x = element_text(size = 8),
+        axis.text.y = element_text(size = 8),
+        strip.text.x = element_text(size = 8),
+        plot.title = element_text(size = 8),
+        legend.position = "none",
+        panel.grid = element_blank())+
+  labs(title = combo.idx)+
+    ylab("")+
+    xlab("")
+})
+
+
+```
